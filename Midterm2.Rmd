@@ -1,0 +1,310 @@
+---
+title: "Midterm2 - STA 309"
+output: html_document
+author: "Claire Aiken"
+date: "10-13-2025"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+library(tidyverse)
+library(tidyr)
+library(lubridate)
+library(countrycode)
+library(sf)
+library(rnaturalearth)
+library(viridis)
+library(ggrepel)
+library(scales)
+library(tidytext)
+library(wordcloud2)
+library(textdata)
+library(ggplot2)
+library(archive)
+library(htmltools)
+library(patchwork)
+```
+
+
+### Dairy: Global Maps & Trends
+
+```{r dairy-load}
+prod_url <- "https://raw.githubusercontent.com/mahsaashouri/STA309-Dataset/main/Milk-Production-Consumption/milk-production-tonnes.csv"
+cons_url <- "https://raw.githubusercontent.com/mahsaashouri/STA309-Dataset/main/Milk-Production-Consumption/per-capita-milk-consumption.csv"
+
+prod <- read_csv(prod_url)
+cons <- read_csv(cons_url)
+```
+
+### Data Prep (Dairy)
+
+```{r dairy-clean}
+prod_long <- prod %>%
+  rename(year = Year, production = `Milk Production (tonnes)`) %>%
+  mutate(year = as.numeric(year))
+
+cons_long <- cons %>%
+  rename(year = Year, consumption = `Milk consumption (kilograms per year per capita)`) %>%
+  mutate(year = as.numeric(year))
+
+
+# Add ISO3 codes for mapping
+prod_long <- prod_long %>% mutate(iso3c = countrycode(Entity, origin='country.name', destination='iso3c'))
+cons_long <- cons_long %>% mutate(iso3c = countrycode(Entity, origin='country.name', destination='iso3c'))
+
+# Merge production & consumption for scatter plot
+prod_cons <- prod_long %>% inner_join(cons_long %>% select(Entity, year, consumption), by = c("Entity","year"))
+
+# Global totals
+global_ts <- prod_long %>% group_by(year) %>% summarize(global_production = sum(production, na.rm=TRUE)) %>% ungroup()
+
+# World map geometry
+world <- ne_countries(scale = "medium", returnclass = "sf")
+
+map_year <- 2022
+
+map_prod <- world %>%
+  left_join(prod_long %>% filter(year == map_year), by = c("iso_a3" = "iso3c"))
+
+map_cons <- world %>%
+  left_join(cons_long %>% filter(year == map_year), by = c("iso_a3" = "iso3c"))
+ 
+```
+
+### Map: Milk Production (2022)
+
+```{r map-production, fig.height=4}
+ggplot(map_prod) +
+  geom_sf(aes(fill = production), color = "grey40", size = 0.1) +
+  scale_fill_viridis(option = "magma", trans = "log10", na.value = "grey95",
+                     labels = label_number(scale_cut = cut_si("unit"))) +
+  labs(title = paste0("Milk production (tonnes) — ", map_year),
+       subtitle = "Log scale used to show large range across countries",
+       caption = "Source: OurWorldInData / FAO") +
+  theme_minimal()
+```
+
+### Map: Per-capita Milk Consumption (2022)
+
+```{r map-consumption, fig.height=4}
+ggplot(global_ts, aes(x = year, y = global_production)) +
+  geom_line(size=1) + geom_point(size=0.8) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_si("unit"))) +
+  labs(title = "Global milk production (1961-2022)",
+       x = "Year", y = "Tonnes (global)") +
+  theme_minimal()
+```
+
+### Global production over time
+
+```{r prod-timeseries, fig.height=3}
+ggplot(global_ts, aes(x = year, y = global_production)) +
+  geom_line(size=1) + geom_point(size=0.8) +
+  scale_y_continuous(labels = label_number(scale_cut = cut_si("unit"))) +
+  labs(title = "Global milk production (1961-2022)",
+       x = "Year", y = "Tonnes (global)") +
+  theme_minimal()
+```
+
+### Production vs Consumption (2022)
+
+```{r prod-vs-cons, fig.height=4}
+plot_df <- prod_cons %>% filter(year != map_year) %>%
+  mutate(log_prod = log10(production + 1), log_cons = log10(consumption + 1))
+
+ggplot(plot_df, aes(x = production, y = consumption)) +
+  geom_point(alpha = 0.6) +
+  geom_smooth(method = "lm", se = TRUE, color = "darkred") +
+  scale_x_log10(labels = label_number(scale_cut = cut_si("unit"))) + scale_y_log10() +
+  labs(title = paste0("Production vs Per-capita Consumption — ", map_year),
+       x = "Production (tonnes, log scale)", y = "Consumption (kg per person, log scale)") +
+  theme_minimal()
+```
+
+
+### Taylor Swift: Lyrics & Sentiment
+
+This section builds a sentiment dashboard for two Taylor Swift albums. The code will download the repository, extract lyrics, and compute sentiment. You can change `album_a` and `album_b` below.
+
+```{r ts-setup}
+# Download Taylor Swift data repo (adashofdata)
+zip_url <- "https://github.com/adashofdata/taylor_swift_data/archive/refs/heads/main.zip"
+zipfile <- tempfile(fileext = ".zip")
+download.file(zip_url, zipfile, quiet = TRUE)
+```
+
+```{r extract}
+out_dir <- file.path(tempdir(), "taylor_swift_data")
+dir.create(out_dir, showWarnings = FALSE)
+
+# Extract everything
+archive_extract(zipfile, dir = out_dir)  # from archive package :contentReference[oaicite:0]{index=0}
+
+repo_root <- out_dir
+# ---------------------------
+# Detect album directories
+# ---------------------------
+# Look for directories that contain .txt files
+album_dirs <- list.dirs(repo_root, recursive = TRUE, full.names = TRUE)
+album_candidates <- album_dirs[sapply(album_dirs, function(d) any(grepl("\\.txt$", list.files(d, full.names = TRUE))))]
+
+if(length(album_candidates) < 2){
+  album_a <- NA
+  album_b <- NA
+} else {
+  album_a <- album_candidates[1]
+  album_b <- album_candidates[2]
+}
+
+message("Detected album directories:")
+print(basename(album_candidates))
+message("Default album_a and album_b set to first two detected.")
+
+```
+
+### Helper: read album lyrics
+
+```{r read-lyrics}
+read_album <- function(album_path){
+  files <- list.files(album_path, pattern = "\\.txt$", full.names = TRUE)
+  files <- files[file.exists(files)]
+  
+  map_df(files, ~{
+    tibble(
+      song_file = .x,
+      text = paste(read_lines(.x), collapse = " \n ")
+    )
+  }) %>%
+    mutate(song = tools::file_path_sans_ext(basename(song_file)))
+}
+
+if(!is.na(album_a) && !is.na(album_b)){
+  albA <- read_album(album_a) %>% mutate(album = basename(album_a))
+  albB <- read_album(album_b) %>% mutate(album = basename(album_b))
+  all_lyrics <- bind_rows(albA, albB)
+} else {
+  all_lyrics <- tibble()
+}
+
+head(all_lyrics)
+
+```
+
+### Wordclouds: Album A & B
+
+```{r wordclouds, results='asis', fig.height=4}
+tidy_words <- all_lyrics %>%
+  mutate(
+    text = str_replace_all(text, "<.*?>", " "),   # remove HTML leftovers
+    text = str_replace_all(text, "embed", " "),   # remove 'embed'
+    text = str_replace_all(text, "[^A-Za-z0-9\\s']", " "), # clean weird chars
+    text = str_squish(text)
+  ) %>%
+  unnest_tokens(word, text) %>%
+  anti_join(stop_words, by = "word") %>%
+  filter(!str_detect(word, "^\\d+$"))
+
+
+# Create word count tables
+wc_A <- tidy_words %>% filter(album == basename(album_a)) %>% count(word, sort = TRUE)
+wc_B <- tidy_words %>% filter(album == basename(album_b)) %>% count(word, sort = TRUE)
+
+wordcloud2::wordcloud2(wc_A, size = 1,  color = 'random-dark')
+
+```
+
+```{r}
+wordcloud2::wordcloud2(wc_B, size = 0.5, color = 'random-dark')
+
+
+```
+
+### Sentiment comparison (bing)
+
+```{r sentiment-analysis, fig.height=3}
+if(nrow(all_lyrics) > 0){
+  bing <- get_sentiments("bing")
+  tidy_sent <- tidy_words %>%
+    inner_join(bing, by = "word") %>%
+    count(album, sentiment) %>%
+    group_by(album) %>%
+    mutate(prop = n / sum(n)) %>%
+    ungroup()
+  
+  p_sent <- ggplot(tidy_sent, aes(x = album, y = prop, fill = sentiment)) +
+    geom_col(position = "dodge") +
+    labs(title = "Sentiment composition by album (bing)", y = "Proportion of sentiment words",
+      x = NULL) + theme_minimal()
+  p_sent
+}
+
+```
+
+### Song-level sentiment & Spotify features
+
+```{r spotify-join, fig.height=4}
+afinn <- get_sentiments("afinn")
+song_sent <- all_lyrics %>%
+  unnest_tokens(word, text) %>%
+  inner_join(afinn, by = "word") %>%
+  group_by(song, album) %>%
+  summarize(sentiment_score = mean(value, na.rm = TRUE), .groups = "drop") %>%
+  mutate(song_key = str_squish(str_replace_all(str_to_lower(song), "[^a-z0-9 ]", "")))
+song_sent
+```
+
+```{r}
+# ---------------------------
+# Song-level sentiment & Spotify join
+# ---------------------------
+spotify_file <- list.files(repo_root, pattern = "spotify|track|features|metadata",
+                           recursive = TRUE, full.names = TRUE, ignore.case = TRUE)
+spotify_file <- spotify_file[grepl("\\.csv$", spotify_file, ignore.case = TRUE)][1]
+spotify <- read_csv(spotify_file)
+
+# Use the correct column names
+norm <- function(x) str_squish(str_replace_all(str_to_lower(x), "[^a-z0-9 ]", ""))
+
+# Song key in Spotify
+spotify <- spotify %>% mutate(song_key = norm(`Song Name`))
+
+# Song key in lyrics
+song_sent <- song_sent %>% mutate(song_key = norm(song))
+
+# Join
+songs_joined <- left_join(song_sent, spotify, by = "song_key")
+
+# Attributes to plot (use your exact names)
+attrs <- c("Danceability","Energy","Valence","Tempo","Acousticness")
+present_attrs <- attrs[attrs %in% names(songs_joined)]
+present_attrs <- head(present_attrs, 4)
+
+scatter_plots <- list()
+for(i in 1:(length(present_attrs)-1)){
+  for(j in (i+1):length(present_attrs)){
+    scatter_plots[[paste0(present_attrs[i], "_vs_", present_attrs[j])]] <- 
+      ggplot(songs_joined, aes_string(x = present_attrs[i], y = present_attrs[j], color = "sentiment_score")) +
+      geom_point(size = 2.5) +
+      scale_color_gradient2(low="red", mid="yellow", high="green", midpoint=0) +
+      theme_minimal(base_size = 11) +
+      theme(legend.position = "none") +
+      labs(x = present_attrs[i], y = present_attrs[j])  # axis labels only
+  }
+}
+
+# ---------------------------
+# Build dashboard with patchwork
+# ---------------------------
+dashboard <- (scatter_plots[[1]] | scatter_plots[[2]]) / 
+             (scatter_plots[[3]] | scatter_plots[[4]]) / 
+             p_sent +
+             plot_annotation(
+               title = "Taylor Swift Lyrics & Spotify Analysis",
+               subtitle = paste("Albums:", basename(album_a), "and", basename(album_b))
+             ) +
+             plot_layout(heights = c(10, 10, 20))  # control relative heights
+
+dashboard
+
+```
+
